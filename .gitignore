@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+.env
+
+# Model Checkpoints (optional: if you generate thousands of temp weights, ignore the folder)
+# checkpoints/
+
+# VS Code specific
+.vscode/
+
+# System
+.DS_Store
