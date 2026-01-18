@@ -1,6 +1,12 @@
 import gradio as gr
 import torch
 import numpy as np
+import time
+import sys
+import os
+
+# Add current directory to path just in case
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from color_war_env import ChainReactionEnv
 from neural_structure import AlphaZeroNet
@@ -9,27 +15,39 @@ from MCTS import MCTS
 # --- Configuration ---
 MODEL_PATH = "best_model.pth" 
 GRID_SIZE = 5
-MCTS_SIMS = 50 
+
+# INCREASED SIMULATIONS
+MCTS_SIMS = 800  
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Load Model ---
 def load_model():
-    print(f"Loading model from {MODEL_PATH} to {DEVICE}...")
+    print(f"Initializing MLP Model on {DEVICE}...")
     model = AlphaZeroNet(grid_size=GRID_SIZE).to(DEVICE)
+    
+    path = MODEL_PATH
+    if not os.path.exists(path):
+        if os.path.exists("latest_model.pth"):
+            path = "latest_model.pth"
+        else:
+            print(f"⚠️ Warning: No model found at {MODEL_PATH} or latest_model.pth. AI will play randomly.")
+            return model
+
+    print(f"Loading weights from {path}...")
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        model.load_state_dict(torch.load(path, map_location=DEVICE))
         model.eval()
-        print("Model loaded successfully.")
-    except FileNotFoundError:
-        print("Warning: Model file not found. AI will play randomly.")
+        print("✅ Model loaded successfully.")
+    except RuntimeError as e:
+        print(f"❌ Architecture Mismatch: {e}")
+        print("Ensure neural_structure.py defines the MLP (Fully Connected) architecture.")
+    
     return model
 
 MODEL = load_model()
 GAME = ChainReactionEnv(grid_size=GRID_SIZE)
 
-# --- CSS Styling (Visuals Only) ---
-# We no longer use CSS for the 5x5 layout (Python does that now).
-# This CSS just makes the buttons look good.
+# --- CSS Styling ---
 CUSTOM_CSS = """
 /* The container for the whole board */
 #board-container {
@@ -44,16 +62,16 @@ CUSTOM_CSS = """
 .board-row {
     gap: 5px !important;
     margin-bottom: 5px !important; 
-    justify-content: center !important; /* Center buttons in the row */
-    display: flex !important;           /* Force flex behavior */
+    justify-content: center !important; 
+    display: flex !important;           
 }
 
 /* Individual Cells */
 .cell-btn {
     height: 70px !important;
     width: 70px !important;
-    min-width: 70px !important; /* Prevent shrinking */
-    max-width: 70px !important; /* Prevent growing */
+    min-width: 70px !important; 
+    max-width: 70px !important; 
     font-size: 24px !important;
     font-weight: bold !important;
     padding: 0 !important;
@@ -65,6 +83,7 @@ CUSTOM_CSS = """
     justify-content: center !important;
     line-height: 1 !important;
     box-shadow: none !important;
+    transition: all 0.2s; /* Add smooth transition */
 }
 
 /* Colors */
@@ -83,6 +102,14 @@ CUSTOM_CSS = """
     border: 3px solid #0033cc !important;
 }
 
+/* Highlighting the AI's last move */
+.last-move {
+    box-shadow: 0 0 15px 5px #ffff00 !important; /* Yellow glow */
+    border-color: #ffff00 !important; /* Yellow border */
+    z-index: 10; 
+    transform: scale(1.05); 
+}
+
 /* Status Box */
 #status-box textarea {
     text-align: center;
@@ -94,10 +121,11 @@ CUSTOM_CSS = """
 
 # --- Game Logic ---
 
-def get_initial_state():
-    return GAME.get_initial_state(), 0, "🔴 Your Turn (Red)" 
-
-def format_board(state):
+def format_board(state, last_ai_move_idx=None):
+    """
+    Renders the board.
+    last_ai_move_idx: The index of the cell the AI just played on (to highlight).
+    """
     updates = []
     atoms = state[:, :, 0].flatten()
     colors = state[:, :, 1].flatten()
@@ -106,135 +134,194 @@ def format_board(state):
         count = int(atoms[i])
         owner = int(colors[i])
         
+        classes = ["cell-btn"]
+        text = ""
+
         if owner == 1:
-            css_class = "cell-red"
+            classes.append("cell-red")
             text = "●" * count 
         elif owner == -1:
-            css_class = "cell-blue"
+            classes.append("cell-blue")
             text = "●" * count
         else:
-            css_class = "cell-neutral"
-            text = ""
+            classes.append("cell-neutral")
+        
+        # Apply Highlight if this is the AI's last move
+        if last_ai_move_idx is not None and i == last_ai_move_idx:
+            classes.append("last-move")
             
-        updates.append(gr.update(value=text, elem_classes=["cell-btn", css_class]))
+        updates.append(gr.update(value=text, elem_classes=classes))
             
     return updates
 
-def ai_move(state, move_count):
+def ai_move_logic(state, move_count, ai_player_id):
+    """Executes AI move and returns (action, new_state, reward, terminated)"""
     args = {'num_simulations': MCTS_SIMS, 'c_puct': 1.0}
     mcts = MCTS(GAME, MODEL, args)
-    probs = mcts.search(state, -1, move_count)
-    return np.argmax(probs)
+    
+    start_time = time.time()
+    # Search from the perspective of the AI player
+    probs = mcts.search(state, ai_player_id, move_count)
+    duration = time.time() - start_time
+    
+    best_move = np.argmax(probs)
+    
+    # Determine flags for Chain Reaction env
+    is_first_r = (move_count == 0)
+    is_first_b = (move_count == 1)
+    
+    new_state = GAME.get_next_state(state, best_move, ai_player_id, first_move_r=is_first_r, first_move_b=is_first_b)
+    
+    is_first_round = move_count < 2
+    reward, terminated = GAME.get_value_and_terminated(new_state, best_move, is_first_round)
+    
+    print(f"🤖 AI Thought Time: {duration:.3f}s | Sims: {MCTS_SIMS} | Choice: {best_move}")
+    return best_move, new_state, reward, terminated
 
-def on_click(btn_idx, state, move_count):
+def on_click(btn_idx, state, move_count, human_player_id, last_ai_move):
+    """
+    human_player_id: 1 (Red) or -1 (Blue)
+    """
     if state is None:
-        state, move_count, _ = get_initial_state()
-        updates = format_board(state)
-        return updates + ["Error. Restarting...", state, move_count]
+        return restart_game("🔴 玩家先手 (紅)") # Default fallback
 
-    # --- 1. Validate User Move (Red) ---
+    # Determine Opponent ID
+    ai_player_id = -human_player_id
+
+    # --- 1. Validate HUMAN Move ---
     flat_colors = state[:,:,1].reshape(-1)
     is_first_round = move_count < 2
     
     if is_first_round:
         if flat_colors[btn_idx] != 0:
-            updates = format_board(state)
-            return updates + ["⚠️ Invalid: First move must be on empty cell.", state, move_count]
+            msg = "⚠️ Invalid: First move must be on empty cell."
+            return format_board(state, last_ai_move) + [msg, state, move_count, human_player_id, last_ai_move]
     else:
-        if flat_colors[btn_idx] == -1:
-             updates = format_board(state)
-             return updates + ["⚠️ Invalid: Cannot place on Blue.", state, move_count]
-        if flat_colors[btn_idx] != 1 and flat_colors[btn_idx] != 0:
-             updates = format_board(state)
-             return updates + ["⚠️ Invalid: Must place on Red cell.", state, move_count]
-        if flat_colors[btn_idx] == 0 and np.sum(flat_colors == 1) > 0:
-             updates = format_board(state)
-             return updates + ["⚠️ Invalid: Must expand from your existing cells.", state, move_count]
+        # Cannot place on opponent
+        if flat_colors[btn_idx] == ai_player_id:
+             msg = "⚠️ Invalid: Cannot place on Opponent's cell."
+             return format_board(state, last_ai_move) + [msg, state, move_count, human_player_id, last_ai_move]
+        
+        # Must place on own color if you have any
+        has_own_cells = np.sum(flat_colors == human_player_id) > 0
+        if flat_colors[btn_idx] == 0 and has_own_cells:
+             msg = "⚠️ Invalid: Must expand from your existing cells."
+             return format_board(state, last_ai_move) + [msg, state, move_count, human_player_id, last_ai_move]
 
-    # --- 2. Execute User Move (Red) ---
+    # --- 2. Execute HUMAN Move ---
     is_first_r = (move_count == 0)
-    is_first_b = False 
+    is_first_b = (move_count == 1)
     
-    new_state = GAME.get_next_state(state, btn_idx, 1, first_move_r=is_first_r, first_move_b=is_first_b)
+    new_state = GAME.get_next_state(state, btn_idx, human_player_id, first_move_r=is_first_r, first_move_b=is_first_b)
     move_count += 1
     
     reward, terminated = GAME.get_value_and_terminated(new_state, btn_idx, move_count < 2)
-    if terminated:
-        if reward == 1:
-            updates = format_board(new_state)
-            return updates + ["🏆 RED WINS! 🏆", new_state, move_count]
-            
-    # --- 3. AI Turn (Blue) ---
-    ai_action = ai_move(new_state, move_count)
-    is_first_r = False
-    is_first_b = (move_count == 1) 
     
-    final_state = GAME.get_next_state(new_state, ai_action, -1, first_move_r=is_first_r, first_move_b=is_first_b)
+    if terminated:
+        status = "🏆 YOU WIN! 🏆" if reward == 1 else "💀 YOU LOST! 💀"
+        return format_board(new_state, None) + [status, new_state, move_count, human_player_id, None]
+            
+    # --- 3. AI Turn ---
+    ai_action, final_state, reward, terminated = ai_move_logic(new_state, move_count, ai_player_id)
     move_count += 1
     
-    reward, terminated = GAME.get_value_and_terminated(final_state, ai_action, move_count < 2)
-    updates = format_board(final_state)
+    updates = format_board(final_state, last_ai_move_idx=ai_action)
     
-    status = "🔴 Your Turn (Red)"
+    status = f"🔴 { 'Red' if human_player_id == 1 else 'Blue'} (Your Turn)"
     if terminated:
-        status = "💀 BLUE WINS! 💀" if reward == 1 else "🏆 RED WINS! 🏆"
+        status = "💀 AI WINS! 💀" if reward == 1 else "🏆 YOU WIN! 🏆"
             
-    return updates + [status, final_state, move_count]
+    return updates + [status, final_state, move_count, human_player_id, ai_action]
 
-def restart_game():
-    state, mc, status = get_initial_state()
-    updates = format_board(state)
-    return updates + [status, state, mc]
+def restart_game(player_choice):
+    """
+    player_choice: String from Radio button
+    """
+    state = GAME.get_initial_state()
+    move_count = 0
+    last_ai_move = None
+    
+    # --- BUG FIX HERE: Correctly check for "Player" (玩家) in Chinese string ---
+    if "玩家" in player_choice:
+        human_player_id = 1  # Human is Red
+        status = "🔴 Your Turn (Red)"
+        updates = format_board(state, None)
+    else:
+        # AI Plays First (Red)
+        human_player_id = -1 # Human is Blue
+        status = "🔵 AI (Red) is thinking..."
+        
+        # AI Plays First Move immediately
+        ai_action, state, reward, terminated = ai_move_logic(state, move_count, 1) # AI is Red (1)
+        move_count += 1
+        last_ai_move = ai_action
+        
+        status = "🔵 Your Turn (Blue)"
+        updates = format_board(state, last_ai_move_idx=ai_action)
+
+    return updates + [status, state, move_count, human_player_id, last_ai_move]
 
 # --- UI Construction ---
 
 RULES_MARKDOWN = """
-### 📜 How to Play
-1. **Red (You)** moves first. **Blue (AI)** moves second.
-2. **First Move Bonus:** Both players place **3 atoms** on their very first turn.
-3. **Explosions:** A cell explodes when it reaches **4 atoms**, scattering atoms to neighbors.
-4. **Capture:** Exploding into an opponent's cell captures it.
-5. **Win:** Eliminate all opponent atoms.
+###  How to Play
+1. **目標:** 清除棋盤上對方的所有點。
+2. **規則:** 每回合在己方顏色的格子增加一個點(第一回合可放三個)。
+3. **爆炸與擴散:** 一個格子在原子數達到 **4** 時會爆炸，原子會向四周擴散，可能造成連鎖反應。
+4. **順序** - **Player First:** 你是紅方(先手).
+   - **AI First:** AI 是紅方(先手), 你是藍方(後手).
 """
 
 with gr.Blocks(title="Chain Reaction AI", css=CUSTOM_CSS) as demo:
-    gr.Markdown("<h1 style='text-align: center;'>⚛️ Chain Reaction vs AlphaZero</h1>")
+    gr.Markdown("<h1 style='text-align: center;'>Chain Reaction trained by AlphaZero</h1>")
     
-    with gr.Accordion("📖 Game Rules", open=False):
+    with gr.Accordion("規則 Game Rules", open=False):
         gr.Markdown(RULES_MARKDOWN)
 
-    # State
+    # Persistent State
     board_state = gr.State()
     move_count = gr.State()
+    human_player = gr.State(value=1) # 1 = Red, -1 = Blue
+    last_ai_move = gr.State(value=None) 
     
     with gr.Row():
+        with gr.Column(scale=1):
+            player_radio = gr.Radio(
+                choices=["🔴 玩家先手 (紅)", "🔵 AI 先手 (紅)"], 
+                value="🔴 玩家先手 (紅)", 
+                label="選擇先後手",
+                interactive=True
+            )
+            start_btn = gr.Button("🔄 New Game", variant="primary")
+        
         status_box = gr.Textbox(label="Game Status", value="Press Start", elem_id="status-box", interactive=False, scale=3)
-        start_btn = gr.Button("🔄 New Game", variant="primary", scale=1)
 
-    # --- THE LAYOUT FIX: Pure Python Rows ---
-    # We create 5 horizontal rows, each with 5 buttons.
-    # We store them in a single 'buttons' list for easy index access (0-24).
     buttons = []
-    
     with gr.Column(elem_id="board-container"):
         for r in range(GRID_SIZE):
             with gr.Row(elem_classes="board-row"):
                 for c in range(GRID_SIZE):
-                    # Create button
                     btn = gr.Button(value="", elem_classes=["cell-btn", "cell-neutral"])
                     buttons.append(btn)
     
-    # Events
-    start_btn.click(restart_game, inputs=[], outputs=buttons + [status_box, board_state, move_count])
+    # Output list
+    outputs = buttons + [status_box, board_state, move_count, human_player, last_ai_move]
+    
+    start_btn.click(
+        restart_game, 
+        inputs=[player_radio], 
+        outputs=outputs
+    )
     
     for i, btn in enumerate(buttons):
         btn.click(
-            lambda s, m, idx=i: on_click(idx, s, m),
-            inputs=[board_state, move_count],
-            outputs=buttons + [status_box, board_state, move_count]
+            lambda s, m, h, l, idx=i: on_click(idx, s, m, h, l),
+            inputs=[board_state, move_count, human_player, last_ai_move],
+            outputs=outputs
         )
     
-    demo.load(restart_game, inputs=[], outputs=buttons + [status_box, board_state, move_count])
+    # Initialize logic on load
+    demo.load(restart_game, inputs=[player_radio], outputs=outputs)
 
 if __name__ == "__main__":
     demo.launch(share=True)

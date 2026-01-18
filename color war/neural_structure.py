@@ -2,62 +2,47 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ResNetBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResNetBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        return F.relu(out)
-
 class AlphaZeroNet(nn.Module):
-    def __init__(self, grid_size=5, num_res_blocks=4, num_channels=64):
+    def __init__(self, grid_size=5, hidden_dim=256):
         super(AlphaZeroNet, self).__init__()
         
-        self.start_conv = nn.Conv2d(2, num_channels, kernel_size=3, padding=1)
-        self.bn_start = nn.BatchNorm2d(num_channels)
+        self.input_dim = grid_size * grid_size * 2  # 5x5 grid, 2 layers (Atoms, Owners)
+        self.action_size = grid_size * grid_size
         
-        self.res_blocks = nn.ModuleList([
-            ResNetBlock(num_channels) for _ in range(num_res_blocks)
-        ])
+        # --- Shared Hidden Layers (Feature Extractor) ---
+        self.fc1 = nn.Linear(self.input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
         
         # --- Policy Head ---
-        self.policy_conv = nn.Conv2d(num_channels, 2, kernel_size=1)
-        self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * grid_size * grid_size, grid_size * grid_size)
+        # Outputs a probability distribution over all moves
+        self.policy_head = nn.Linear(hidden_dim, self.action_size)
         
         # --- Value Head ---
-        self.value_conv = nn.Conv2d(num_channels, 1, kernel_size=1)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(grid_size * grid_size, 64)
-        self.value_fc2 = nn.Linear(64, 1)
+        # Outputs a scalar value [-1, 1] evaluation of the board
+        self.value_head_fc = nn.Linear(hidden_dim, 64)
+        self.value_head_out = nn.Linear(64, 1)
 
     def forward(self, x):
-        # x is (Batch, 2, 5, 5)
+        # x input shape: (Batch, 2, 5, 5) or (Batch, 5, 5, 2) depending on preprocessing
+        # We need to flatten it to (Batch, 50)
         
-        x = F.relu(self.bn_start(self.start_conv(x)))
+        x = x.reshape(x.size(0), -1)  # Flatten
         
-        for block in self.res_blocks:
-            x = block(x)
-            
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = F.relu(self.bn3(self.fc3(x)))
+        
         # Policy Head
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
-        # FIX: Changed .view() to .reshape() to handle non-contiguous tensors safely
-        p = p.reshape(p.size(0), -1)  
-        p = self.policy_fc(p)
+        p = self.policy_head(x)
         p = F.log_softmax(p, dim=1)
         
         # Value Head
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = v.reshape(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        v = torch.tanh(self.value_fc2(v))
+        v = F.relu(self.value_head_fc(x))
+        v = torch.tanh(self.value_head_out(v))
         
         return p, v

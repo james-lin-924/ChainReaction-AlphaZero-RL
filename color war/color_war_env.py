@@ -1,4 +1,11 @@
 import numpy as np
+import game_core
+
+import numpy as np
+try:
+    import game_core
+except ImportError:
+    print("WARNING: Could not import 'game_core' C++ module. Ensure setup.py was run.")
 
 
 class ChainReactionEnv:
@@ -42,55 +49,23 @@ class ChainReactionEnv:
 
     def get_next_state(self, state, action, player, first_move_r=True, first_move_b=True):
         """
-        Calculates the new state after a player makes a move (action).
-        Note: This returns a deep copy to prevent modifying the original state.
+        Calculates the new state using the fast C++ extension.
         """
-        # Create a deep copy of the state to work with
-        new_state = state.copy() 
-        r, c = self._action_to_coords(action)
-
-        # 1. Place atom(s)
-        # Check if it's a first move and apply the +3 bonus (modifying the original rule slightly)
-        atom_increase = 1
-        if player == 1 and first_move_r:
-            atom_increase = 3
-        elif player == -1 and first_move_b:
-            atom_increase = 3
+        # 1. CRITICAL: Convert state to int32 (C++ expects 4-byte integers)
+        # Without this, the C++ code reads out of bounds and SEGFAULTS.
+        state_int = state.astype(np.int32)
         
-        # Place the atom(s) and set/claim ownership
-        new_state[r, c, 0] += atom_increase
-        new_state[r, c, 1] = player
-
-        # 2. Handle Chain Reactions (Explosions)
-        while True:
-            # Find all cells that are over the critical mass
-            exploding_cells = np.where(new_state[:, :, 0] >= self.critical_mass)
-            
-            if len(exploding_cells[0]) == 0:
-                break # No more explosions, board is stable
-
-            # Process all exploding cells in this wave
-            for er, ec in zip(*exploding_cells):
-                # Explosion removes critical mass
-                explosion_color = new_state[er, ec, 1]
-                new_state[er, ec, 0] = 0 # Atoms reset
-                new_state[er, ec, 1] = 0 # Cell becomes neutral
-
-                # Spread to neighbors
-                directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
-                for dr, dc in directions:
-                    nr, nc = er + dr, ec + dc
-                    
-                    # Check bounds
-                    if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
-                        # Give atom
-                        new_state[nr, nc, 0] += 1
-                        # Claim neighbor's color (ownership transfer)
-                        new_state[nr, nc, 1] = explosion_color
-                        
+        # 2. Call C++ function
+        # We also cast arguments to standard Python ints to be safe
+        new_state = game_core.get_next_state(
+            state_int, 
+            int(action), 
+            int(player), 
+            bool(first_move_r), 
+            bool(first_move_b)
+        )
+        
         return new_state
-
-    # --- Move & Win Condition Checks ---
 
     def get_valid_moves(self, state, player, first_round):
         """
